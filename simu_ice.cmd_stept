@@ -1,0 +1,174 @@
+#!/bin/bash
+##SBATCH --account=def-ng50
+#SBATCH --account=ctb-ng50
+#SBATCH --job-name=elev_stept
+#SBATCH --output=%x-%j.out
+#SBATCH --ntasks=24              # number of MPI processes
+#SBATCH --mem-per-cpu=1024M      # memory; default unit is megabytes
+#SBATCH --time=5-00:00           # time (DD-HH:MM)
+
+
+
+. /etc/profile
+
+pwd
+
+#module load netcdf-fortran-mpi/4.5.1
+#module list
+#which mpirun
+
+###########################################################################
+# Script to perform several chained GCM simulations
+# SET HERE the maximum total number of simulations
+
+nummax=10
+
+###########################################################################
+
+
+
+echo "---------------------------------------------------------"
+echo "starting run0"
+
+dir=`pwd`
+machine=`hostname`
+address=`whoami`
+
+# Look for file "num_run" which should contain 
+# the value of the previously computed season
+# (defaults to 0 if file "num_run" does not exist)
+if [[ -r num_run ]] ; then
+  echo "found file num_run"
+  numold=`cat num_run`
+else
+  numold=0
+fi
+echo "numold is set to" ${numold}
+
+
+# Set value of current season 
+(( numnew = ${numold} + 1 ))
+echo "numnew is set to" ${numnew}
+
+if [[ ${numnew} -le 9 ]] ; then
+   fnumnew=00${numnew}
+elif [[ ${numnew} -le 99 ]] ; then
+   fnumnew=0${numnew}
+fi
+
+if [[ ${numold} -le 9 ]] ; then
+   fnumold=00${numold}
+elif [[ ${numold} -le 99 ]] ; then
+   fnumold=0${numold}
+fi
+
+
+
+# Look for initialization data files (exit if none found)
+if [[ ( -r start.${fnumold}.elev.nc  &&  -r startfi.${fnumold}.elev.nc ) ]] ; then
+   \ln -fs start.${fnumold}.elev.nc start.nc
+   \ln -fs startfi.${fnumold}.elev.nc startfi.nc
+else
+   if (( ${numold} == 99999 )) ; then
+    echo "No run because previous run crashed ! (99999 in num_run)"
+    exit
+   else
+   echo "Where is file start."${fnumold}".elev.nc??"
+   exit
+   fi
+fi
+
+
+
+
+
+mpirun -np 24 ./gcm_64x48x26_phystd_para.e  > gcm.${fnumnew}.out
+ 
+ 
+ 
+ 
+ 
+# Check if run ended normaly and copy datafiles
+if [[ ( -r restartfi.nc  &&  -r restart.nc ) ]] ; then
+  echo "Run seems to have ended normaly"
+  \mv -f restartfi.nc startfi.${fnumnew}.nc
+  \mv -f restart.nc start.${fnumnew}.nc
+else
+  if [[ -r num_run ]] ; then
+    \mv -f num_run num_run.crash
+  else
+    echo "No file num_run to build num_run.crash from !!"
+    # Impose a default value of 0 for num_run
+    echo 0 > num_run.crash
+  fi
+ echo 99999 > num_run
+############## To receive an Email message if the run crashes ########
+# mail -s "crash run GCM" $address <<ENDMAIL
+# The run on $machine in $dir has just crashed.
+# ENDMAIL
+############################################"" 
+ exit
+fi
+
+
+
+
+mv -f diagfi.nc diagfi.${fnumnew}.nc
+  
+
+
+# create archive
+ln -fs start.${fnumnew}.nc start.nc
+ln -fs startfi.${fnumnew}.nc startfi.nc
+rm -f start_archive.nc
+./start2archive_64x48x26_phystd_seq.e > start2archive.${fnumnew}.out
+
+
+# vertical interpolation to altitude levels
+sed -i "s/diagfi.*/diagfi.${fnumnew}.nc/g" zrlow.def
+zrecast.e < zrlow.def
+module load nco
+ncks -A -v aire diagfi.${fnumnew}.nc diagfi.${fnumnew}_A.nc
+module load netcdf # reload netcdf correct version that was ditched by nco - otherwise python netCDF4 does not work (7/10/23)
+
+# load virtual env and change elevation
+virtualenv --no-download ~/ENV
+source ~/ENV/bin/activate
+pip install --no-index --upgrade pip
+module load python
+module load scipy-stack
+pip install --no-index netCDF4
+echo "inside virtualenv !!"
+guess_elevation.py diagfi.${fnumnew}_A.nc > guess_elevation.${fnumnew}.out
+deactivate 
+
+
+# create new elevation
+id=$(date +%s)
+ln -fs $dir/surface_icedyn.${fnumnew}_A.nc  ../../datagcm/surface_icedyn.$id.nc
+sed -i "s/surface_icedyn.*/surface_icedyn.$id.nc/g" newstart.def
+./newstart_64x48x26_phystd_seq.e < newstart.def  > newstart.${fnumnew}.out
+mv -f restartfi.nc startfi.${fnumnew}.elev.nc
+mv -f restart.nc   start.${fnumnew}.elev.nc
+
+
+
+# Prepare things for upcoming runs by writing
+# value of computed season in file num_run
+echo ${numnew} > num_run
+
+
+
+
+# If we are over nummax : stop
+if (( $numnew + 1 > $nummax )) ; then
+   exit
+else
+   \cp -f simu_ice.cmd exe_exo
+   ./exe_exo
+fi
+
+
+
+
+
